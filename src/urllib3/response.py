@@ -28,6 +28,7 @@ except ImportError:
 from . import util
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
+from ._flight import RequestFlight
 from .connection import BaseSSLError, HTTPConnection, HTTPException
 from .exceptions import (
     BodyNotHttplibCompatible,
@@ -504,6 +505,11 @@ class BaseHTTPResponse(io.IOBase):
         self._request_url: str | None = request_url
         self.retries = retries
 
+        # Outbound send flight of the request that produced this response,
+        # attached by the pooling layer. ``None`` for responses not created
+        # through a pool (raw connection use, emscripten wrapper, ...).
+        self._request_flight: RequestFlight | None = None
+
         self.chunked = False
         tr_enc = self.headers.get("transfer-encoding", "").lower()
         # Don't incur the penalty of creating a list and then discarding it
@@ -563,6 +569,18 @@ class BaseHTTPResponse(io.IOBase):
 
     @property
     def connection(self) -> BaseHTTPConnection | None:
+        raise NotImplementedError()
+
+    @property
+    def request_flight(self) -> RequestFlight | None:
+        """
+        The outbound send flight of the request that produced this response.
+
+        Unlike :attr:`connection`, this stays available after the connection
+        was released back to the pool or discarded as dirty, so middleware and
+        redirect handling can observe how far the request body got onto the
+        wire.
+        """
         raise NotImplementedError()
 
     @property
@@ -845,6 +863,10 @@ class HTTPResponse(BaseHTTPResponse):
     @property
     def connection(self) -> HTTPConnection | None:
         return self._connection
+
+    @property
+    def request_flight(self) -> RequestFlight | None:
+        return self._request_flight
 
     def isclosed(self) -> bool:
         return is_fp_closed(self._fp)

@@ -12,6 +12,7 @@ from types import TracebackType
 
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
+from ._flight import BodyKind
 from ._request_methods import RequestMethods
 from .connection import (
     BaseSSLError,
@@ -38,6 +39,7 @@ from .exceptions import (
     ReadTimeoutError,
     SSLError,
     TimeoutError,
+    UnrewindableBodyError,
 )
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
@@ -121,6 +123,29 @@ class ConnectionPool:
 
 # This is taken from http://hg.python.org/cpython/file/7aaba721ebc0/Lib/socket.py#l252
 _blocking_errnos = {errno.EAGAIN, errno.EWOULDBLOCK}
+
+
+def _one_shot_body_already_streamed(
+    conn: BaseHTTPConnection | None, body: typing.Any
+) -> bool:
+    """
+    Whether re-sending *body* on *conn* would iterate an already consumed
+    one-shot iterable/generator.
+
+    This is true only when the connection's last send flight classified the
+    body as :attr:`~urllib3.BodyKind.ONE_SHOT_ITERABLE` and actually started
+    streaming it. ``bytes``-like bodies, ``None`` and file-like bodies (whose
+    re-send is handled by the ``body_pos`` rewind machinery) never match.
+    """
+    if conn is None or body is None:
+        return False
+
+    flight = conn.flight
+    return (
+        flight is not None
+        and flight.body_kind is BodyKind.ONE_SHOT_ITERABLE
+        and flight.body_started
+    )
 
 
 class HTTPConnectionPool(ConnectionPool, RequestMethods):
@@ -311,6 +336,26 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         If the pool is closed, then the connection will be closed and discarded.
         """
+        if conn is not None:
+            flight = conn.flight
+            if flight is not None and flight.is_dirty:
+                # The request body was aborted while it was being sent
+                # (e.g. BrokenPipeError mid-body, possibly swallowed so a
+                # response could still be salvaged). The request/response
+                # framing on this socket can't be trusted for another
+                # exchange, so it must never be reused as a keep-alive
+                # connection. The salvageable response, if any, is already
+                # being returned to the caller; here we only discard the
+                # socket and refill the pool slot.
+                log.debug(
+                    "Discarding connection %s: outbound request body was "
+                    "aborted mid-flight (%s).",
+                    self.host,
+                    flight,
+                )
+                conn.close()
+                conn = None
+
         if self.pool is not None:
             try:
                 self.pool.put(conn, block=False)
@@ -546,6 +591,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         response.retries = retries
         response._connection = response_conn  # type: ignore[attr-defined]
         response._pool = self  # type: ignore[attr-defined]
+        # Expose the send flight on the response as well. This survives the
+        # connection being released back (or, for a dirty aborted flight,
+        # being discarded) and lets upper layers (PoolManager redirects,
+        # middleware) observe how far the request got after the fact.
+        response._request_flight = conn.flight
 
         log.debug(
             '%s://%s:%s "%s %s %s" %s %s',
@@ -759,6 +809,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # complains about UnboundLocalError.
         err = None
 
+        # Records whether the failed attempt already streamed a one-shot
+        # iterable body, in which case the retry recursion below must fail
+        # loudly instead of iterating the spent object into an empty body.
+        one_shot_body_streamed = False
+
         # Keep track of whether we cleanly exited the except block. This
         # ensures we do proper cleanup in finally.
         clean_exit = False
@@ -851,6 +906,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
             # Keep track of the error for the retry warning.
             err = e
+            # Capture this before the connection is closed in 'finally',
+            # since the flight lives on the connection.
+            one_shot_body_streamed = _one_shot_body_already_streamed(conn, body)
 
         finally:
             if not clean_exit:
@@ -870,6 +928,16 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 self._put_conn(conn)
 
         if not conn:
+            # The failed attempt already streamed a one-shot iterable/generator
+            # body: it can't be iterated again, so refuse instead of silently
+            # re-sending an empty body as a 'successful' retry. bytes-like
+            # bodies and file-like bodies (rewound via body_pos) still retry.
+            if one_shot_body_streamed:
+                raise UnrewindableBodyError(
+                    "Request body is a one-shot iterable that has already "
+                    "started being sent and cannot be sent again on retry."
+                ) from err
+
             # Try again
             log.warning(
                 "Retrying (%r) after connection broken by '%r': %s",
@@ -938,6 +1006,14 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
             response.drain_conn()
             retries.sleep_for_retry(response)
+            if _one_shot_body_already_streamed(conn, body):
+                # The body was already consumed on this connection; a
+                # 303-redirect would have removed it above. Refuse to silently
+                # replay an exhausted one-shot iterable on the new target.
+                raise UnrewindableBodyError(
+                    "Request body is a one-shot iterable that has already "
+                    "been sent and cannot be sent again on redirect."
+                )
             log.debug("Redirecting %s -> %s", url, redirect_location)
             return self.urlopen(
                 method,
@@ -970,6 +1046,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
             response.drain_conn()
             retries.sleep(response)
+            if _one_shot_body_already_streamed(conn, body):
+                raise UnrewindableBodyError(
+                    "Request body is a one-shot iterable that has already "
+                    "been sent and cannot be sent again on status retry."
+                )
             log.debug("Retry: %s", url)
             return self.urlopen(
                 method,

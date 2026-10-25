@@ -2626,6 +2626,171 @@ class TestBrokenPipe(SocketDummyServerTestCase):
             assert r.data == b"xxxxxxxxxx"
 
 
+class TestSendFlightLifecycle(SocketDummyServerTestCase):
+    @notWindows()
+    def test_half_sent_body_salvaged_but_dirty_conn_discarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The server sends a keep-alive response and then resets while the
+        # client is still pushing a large body. urllib3 must (a) still
+        # salvage the response as it has always done, yet (b) never return
+        # the half-sent, dirty connection to the pool as reusable.
+        sock_shut = threading.Event()
+        orig_connect = HTTPConnection.connect
+        # a buffer that will cause two sendall calls
+        buf = "a" * 1024 * 1024 * 4
+
+        def connect_and_wait(*args: typing.Any, **kw: typing.Any) -> None:
+            ret = orig_connect(*args, **kw)
+            assert sock_shut.wait(5)
+            return ret
+
+        def socket_handler(listener: socket.socket) -> None:
+            sock = listener.accept()[0]
+            # Explicitly keep-alive: without the dirty-flight rule this
+            # connection would be pooled and handed out to the next request.
+            sock.send(
+                b"HTTP/1.1 404 Not Found\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            sock.shutdown(socket.SHUT_RDWR)
+            sock_shut.set()
+            sock.close()
+
+        monkeypatch.setattr(HTTPConnection, "connect", connect_and_wait)
+        self._start_server(socket_handler)
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            r = pool.request("POST", "/", body=buf)
+            # Salvage semantics are unchanged...
+            assert r.status == 404
+            # ...but the flight reports the send as an aborted, dirty body.
+            assert r.request_flight is not None
+            assert r.request_flight.is_dirty is True
+            # ...and the return path discarded the socket instead of
+            # pooling it as a (supposedly) keep-alive connection.
+            assert pool.pool.qsize() == 1
+            assert pool.pool.get_nowait() is None
+
+    def test_one_shot_generator_redirect_fails_explicitly(self) -> None:
+        # A generator body that was fully streamed on a 307 redirect cannot
+        # be replayed. The pool must raise instead of silently re-iterating
+        # the spent generator into an empty body on the new target.
+        captured: list[bytes] = []
+        done = threading.Event()
+
+        def socket_handler(listener: socket.socket) -> None:
+            sock = listener.accept()[0]
+            # Drain the complete first, chunked request. Note the terminator
+            # we match on includes the preceding CRLF, since the User-Agent
+            # header value itself ends in "0\r\n\r\n".
+            request = b""
+            while not request.endswith(b"\r\n0\r\n\r\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                request += chunk
+            captured.append(request)
+
+            sock.sendall(
+                b"HTTP/1.1 307 Temporary Redirect\r\n"
+                b"Location: /elsewhere\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+
+            # The redirected request must never reach the wire.
+            sock.settimeout(2)
+            try:
+                second = sock.recv(65536)
+            except OSError:
+                second = b""
+            captured.append(second)
+            done.set()
+            sock.close()
+
+        self._start_server(socket_handler)
+        from urllib3.exceptions import UnrewindableBodyError
+        from urllib3.util.retry import Retry
+
+        retries = Retry(
+            total=10,
+            redirect=10,
+            allowed_methods=frozenset(["GET", "HEAD", "POST"]),
+        )
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            with pytest.raises(UnrewindableBodyError):
+                pool.urlopen(
+                    "POST",
+                    "/",
+                    body=iter([b"chunk1", b"chunk2"]),
+                    chunked=True,
+                    retries=retries,
+                )
+
+        # The first request carried the real body; nothing was sent again.
+        assert done.wait(5)
+        assert b"chunk1" in captured[0]
+        assert b"chunk2" in captured[0]
+        assert captured[1] == b""
+
+    def test_file_like_body_rewinds_and_replays_on_redirect(self) -> None:
+        # The one-shot rule must not catch file-like bodies: they keep the
+        # pin's body_pos rewind semantics and are re-sent with their content.
+        captured: list[bytes] = []
+
+        def socket_handler(listener: socket.socket) -> None:
+            sock = listener.accept()[0]
+
+            first = b""
+            while not first.endswith(b"\r\n0\r\n\r\n"):
+                first += sock.recv(65536)
+            captured.append(first)
+
+            sock.sendall(
+                b"HTTP/1.1 307 Temporary Redirect\r\n"
+                b"Location: /ok\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+
+            second = b""
+            while not second.endswith(b"\r\n0\r\n\r\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                second += chunk
+            captured.append(second)
+
+            sock.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Length: 0\r\n\r\n"
+            )
+            sock.close()
+
+        self._start_server(socket_handler)
+        from urllib3.util.retry import Retry
+
+        retries = Retry(
+            total=10,
+            redirect=10,
+            allowed_methods=frozenset(["GET", "HEAD", "POST"]),
+        )
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            r = pool.urlopen(
+                "POST",
+                "/",
+                body=io.BytesIO(b"filebody"),
+                chunked=True,
+                retries=retries,
+            )
+
+        assert r.status == 200
+        # Both the original and the redirected request carried the full,
+        # rewound file body.
+        assert len(captured) == 2
+        assert captured[0].count(b"filebody") == 1
+        assert captured[1].count(b"filebody") == 1
+
+
 class TestMultipartResponse(SocketDummyServerTestCase):
     def test_multipart_assert_header_parsing_no_defects(self) -> None:
         quit_event = threading.Event()

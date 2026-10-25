@@ -41,6 +41,7 @@ except (ImportError, AttributeError):
 from ._base_connection import _TYPE_BODY
 from ._base_connection import ProxyConfig as ProxyConfig
 from ._base_connection import _ResponseOptions as _ResponseOptions
+from ._flight import RequestFlight
 from ._version import __version__
 from .exceptions import (
     ConnectTimeoutError,
@@ -160,6 +161,7 @@ class HTTPConnection(_HTTPConnection):
 
     _has_connected_to_proxy: bool
     _response_options: _ResponseOptions | None
+    _flight: RequestFlight | None
     _tunnel_host: str | None
     _tunnel_port: int | None
     _tunnel_scheme: str | None
@@ -191,6 +193,7 @@ class HTTPConnection(_HTTPConnection):
 
         self._has_connected_to_proxy = False
         self._response_options = None
+        self._flight: RequestFlight | None = None
         self._tunnel_host: str | None = None
         self._tunnel_port: int | None = None
         self._tunnel_scheme: str | None = None
@@ -426,6 +429,23 @@ class HTTPConnection(_HTTPConnection):
         return self._has_connected_to_proxy
 
     @property
+    def flight(self) -> RequestFlight | None:
+        """
+        The outbound send flight of the most recent
+        :meth:`request` on this connection, or ``None`` before the first
+        request and after :meth:`close`.
+
+        The returned :class:`~urllib3.RequestFlight` is read-only and lets
+        callers and middleware observe whether the last outbound exchange
+        was still sending headers, streaming its body, completed, or aborted
+        (and whether an aborted connection is dirty and therefore
+        unpoolable). It is not reset by :meth:`getresponse`, so the state of
+        the last send stays observable while the response is salvaged or
+        consumed; the next :meth:`request` starts a fresh flight.
+        """
+        return self._flight
+
+    @property
     def proxy_is_forwarding(self) -> bool:
         """
         Return True if a forwarding proxy is configured, else return False
@@ -450,6 +470,7 @@ class HTTPConnection(_HTTPConnection):
             self.proxy_is_verified = None
             self._has_connected_to_proxy = False
             self._response_options = None
+            self._flight = None
             self._tunnel_host = None
             self._tunnel_port = None
             self._tunnel_scheme = None
@@ -526,64 +547,90 @@ class HTTPConnection(_HTTPConnection):
         header_keys = frozenset(to_str(k.lower()) for k in headers)
         skip_accept_encoding = "accept-encoding" in header_keys
         skip_host = "host" in header_keys
-        self.putrequest(
-            method, url, skip_accept_encoding=skip_accept_encoding, skip_host=skip_host
-        )
 
         # Transform the body into an iterable of sendall()-able chunks
-        # and detect if an explicit Content-Length is doable.
+        # and detect if an explicit Content-Length is doable. This also
+        # classifies the body for the send flight. The flight belongs to
+        # this request send only; the CONNECT tunnel handshake happens in
+        # connect() before any flight exists and therefore never taints it.
         chunks_and_cl = body_to_chunks(body, method=method, blocksize=self.blocksize)
         chunks = chunks_and_cl.chunks
         content_length = chunks_and_cl.content_length
+        flight = RequestFlight(
+            chunks_and_cl.body_kind, method=method, request_url=url
+        )
+        self._flight = flight
 
-        # When chunked is explicit set to 'True' we respect that.
-        if chunked:
-            if "transfer-encoding" not in header_keys:
-                self.putheader("Transfer-Encoding", "chunked")
-        else:
-            # Detect whether a framing mechanism is already in use. If so
-            # we respect that value, otherwise we pick chunked vs content-length
-            # depending on the type of 'body'.
-            if "content-length" in header_keys:
-                chunked = False
-            elif "transfer-encoding" in header_keys:
-                chunked = True
+        try:
+            self.putrequest(
+                method,
+                url,
+                skip_accept_encoding=skip_accept_encoding,
+                skip_host=skip_host,
+            )
 
-            # Otherwise we go off the recommendation of 'body_to_chunks()'.
+            # When chunked is explicit set to 'True' we respect that.
+            if chunked:
+                if "transfer-encoding" not in header_keys:
+                    self.putheader("Transfer-Encoding", "chunked")
             else:
-                chunked = False
-                if content_length is None:
-                    if chunks is not None:
-                        chunked = True
-                        self.putheader("Transfer-Encoding", "chunked")
+                # Detect whether a framing mechanism is already in use. If so
+                # we respect that value, otherwise we pick chunked vs content-length
+                # depending on the type of 'body'.
+                if "content-length" in header_keys:
+                    chunked = False
+                elif "transfer-encoding" in header_keys:
+                    chunked = True
+
+                # Otherwise we go off the recommendation of 'body_to_chunks()'.
                 else:
-                    self.putheader("Content-Length", str(content_length))
+                    chunked = False
+                    if content_length is None:
+                        if chunks is not None:
+                            chunked = True
+                            self.putheader("Transfer-Encoding", "chunked")
+                    else:
+                        self.putheader("Content-Length", str(content_length))
 
-        # Now that framing headers are out of the way we send all the other headers.
-        if "user-agent" not in header_keys:
-            self.putheader("User-Agent", _get_default_user_agent())
-        for header, value in headers.items():
-            self.putheader(header, value)
-        self.endheaders()
+            # Now that framing headers are out of the way we send all the other headers.
+            if "user-agent" not in header_keys:
+                self.putheader("User-Agent", _get_default_user_agent())
+            for header, value in headers.items():
+                self.putheader(header, value)
+            self.endheaders()
+            flight._headers_sent()
 
-        # If we're given a body we start sending that in chunks.
-        if chunks is not None:
-            for chunk in chunks:
-                # Sending empty chunks isn't allowed for TE: chunked
-                # as it indicates the end of the body.
-                if not chunk:
-                    continue
-                if isinstance(chunk, str):
-                    chunk = chunk.encode("utf-8")
-                if chunked:
-                    self.send(b"%x\r\n%b\r\n" % (len(chunk), chunk))
-                else:
-                    self.send(chunk)
+            # If we're given a body we start sending that in chunks.
+            if chunks is not None:
+                for chunk in chunks:
+                    # Sending empty chunks isn't allowed for TE: chunked
+                    # as it indicates the end of the body.
+                    if not chunk:
+                        continue
+                    if isinstance(chunk, str):
+                        chunk = chunk.encode("utf-8")
+                    # The first non-empty chunk is what actually puts the body
+                    # on the wire, not the chunked terminating chunk below.
+                    flight._body_in_flight()
+                    if chunked:
+                        self.send(b"%x\r\n%b\r\n" % (len(chunk), chunk))
+                    else:
+                        self.send(chunk)
 
-        # Regardless of whether we have a body or not, if we're in
-        # chunked mode we want to send an explicit empty chunk.
-        if chunked:
-            self.send(b"0\r\n\r\n")
+            # Regardless of whether we have a body or not, if we're in
+            # chunked mode we want to send an explicit empty chunk.
+            if chunked:
+                self.send(b"0\r\n\r\n")
+        except BaseException as e:
+            # Any failure while sending (including BrokenPipeError, which the
+            # pool layer may swallow in order to salvage a response) marks the
+            # flight. A flight aborted after the body started streaming makes
+            # the connection dirty, independently of whether a response is
+            # salvaged off the wire.
+            flight._abort(e)
+            raise
+
+        flight._complete()
 
     def request_chunked(
         self,

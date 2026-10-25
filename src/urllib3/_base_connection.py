@@ -32,6 +32,7 @@ if typing.TYPE_CHECKING:
     import ssl
     from typing import Protocol
 
+    from ._flight import RequestFlight
     from .response import BaseHTTPResponse
 
     class BaseHTTPConnection(Protocol):
@@ -113,6 +114,10 @@ if typing.TYPE_CHECKING:
             This returns False if no proxy is in use. Used to determine whether
             errors are coming from the proxy layer or from tunnelling to the target origin.
             """
+
+        @property
+        def flight(self) -> RequestFlight | None:
+            """The outbound send flight of the most recent request, if any."""
 
     class BaseHTTPSConnection(BaseHTTPConnection, Protocol):
         default_port: typing.ClassVar[int]

@@ -8,6 +8,7 @@ from types import TracebackType
 from urllib.parse import urljoin
 
 from ._collections import HTTPHeaderDict, RecentlyUsedContainer
+from ._flight import BodyKind
 from ._request_methods import RequestMethods
 from .connection import ProxyConfig
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
@@ -16,6 +17,7 @@ from .exceptions import (
     MaxRetryError,
     ProxySchemeUnknown,
     URLSchemeUnknown,
+    UnrewindableBodyError,
 )
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
@@ -503,6 +505,23 @@ class PoolManager(RequestMethods):
 
         kw["retries"] = retries
         kw["redirect"] = redirect
+
+        # A one-shot iterable body already streamed on the first attempt can't
+        # be iterated again for the redirect (a 303 above would have removed
+        # the body). The connection pool can't see this flight across pools,
+        # so check the flight recorded on the response before following.
+        flight = getattr(response, "_request_flight", None)
+        if (
+            kw.get("body") is not None
+            and flight is not None
+            and flight.body_kind is BodyKind.ONE_SHOT_ITERABLE
+            and flight.body_started
+        ):
+            response.drain_conn()
+            raise UnrewindableBodyError(
+                "Request body is a one-shot iterable that has already "
+                "been sent and cannot be sent again on redirect."
+            )
 
         log.info("Redirecting %s -> %s", url, redirect_location)
 

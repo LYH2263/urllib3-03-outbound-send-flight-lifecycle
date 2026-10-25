@@ -12,9 +12,11 @@ import h2.events
 
 from .._base_connection import _TYPE_BODY
 from .._collections import HTTPHeaderDict
+from .._flight import RequestFlight
 from ..connection import HTTPSConnection, _get_default_user_agent
 from ..exceptions import ConnectionError
 from ..response import BaseHTTPResponse
+from ..util.request import classify_body_kind
 
 orig_HTTPSConnection = HTTPSConnection
 
@@ -299,11 +301,22 @@ class HTTP2Connection(HTTPSConnection):
         if b"user-agent" not in dict(self._headers):
             self.putheader(b"user-agent", _get_default_user_agent())
 
-        if body:
-            self.endheaders(message_body=body)
-            self.send(body)
-        else:
-            self.endheaders()
+        flight = RequestFlight(
+            classify_body_kind(body), method=method, request_url=url
+        )
+        self._flight = flight
+        try:
+            if body:
+                flight._body_in_flight()
+                self.endheaders(message_body=body)
+                self.send(body)
+            else:
+                self.endheaders()
+            flight._headers_sent()
+        except BaseException as e:
+            flight._abort(e)
+            raise
+        flight._complete()
 
     def close(self) -> None:
         with self._h2_conn as conn:

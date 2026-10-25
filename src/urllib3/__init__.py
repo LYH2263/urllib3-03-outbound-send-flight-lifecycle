@@ -14,6 +14,7 @@ from logging import NullHandler
 from . import exceptions
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
+from ._flight import BodyKind, FlightPhase, RequestFlight
 from ._version import __version__
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
@@ -66,6 +67,9 @@ __all__ = (
     "proxy_from_url",
     "request",
     "BaseHTTPResponse",
+    "RequestFlight",
+    "FlightPhase",
+    "BodyKind",
 )
 
 logging.getLogger(__name__).addHandler(NullHandler())

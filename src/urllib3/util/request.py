@@ -6,6 +6,7 @@ import typing
 from base64 import b64encode
 from enum import Enum
 
+from .._flight import BodyKind
 from ..exceptions import UnrewindableBodyError
 from .util import to_bytes
 
@@ -228,6 +229,39 @@ def rewind_body(body: typing.IO[typing.AnyStr], body_pos: _TYPE_BODY_POSITION) -
 class ChunksAndContentLength(typing.NamedTuple):
     chunks: typing.Iterable[bytes] | None
     content_length: int | None
+    body_kind: BodyKind
+
+
+def classify_body_kind(body: typing.Any | None) -> BodyKind:
+    """Classify an outbound request body the same way
+    :func:`body_to_chunks` does, without consuming it.
+
+    The result drives the send flight:
+
+    - ``None`` -> :attr:`BodyKind.NONE`
+    - ``str``/``bytes`` or any buffer-protocol object ->
+      :attr:`BodyKind.BYTES_LIKE`
+    - file-like objects (``read()``) -> :attr:`BodyKind.REWINDABLE_FILE`;
+      replay keeps going through the ``body_pos``/``seek()`` machinery,
+      which raises :class:`UnrewindableBodyError` on its own when the
+      stream can't seek back.
+    - any other iterable/generator -> :attr:`BodyKind.ONE_SHOT_ITERABLE`
+    """
+    if body is None:
+        return BodyKind.NONE
+
+    if isinstance(body, (str, bytes)):
+        return BodyKind.BYTES_LIKE
+
+    if hasattr(body, "read"):
+        return BodyKind.REWINDABLE_FILE
+
+    try:
+        memoryview(body)
+    except TypeError:
+        return BodyKind.ONE_SHOT_ITERABLE
+    else:
+        return BodyKind.BYTES_LIKE
 
 
 def body_to_chunks(
@@ -244,12 +278,14 @@ def body_to_chunks(
 
     chunks: typing.Iterable[bytes] | None
     content_length: int | None
+    body_kind: BodyKind
 
     # No body, we need to make a recommendation on 'Content-Length'
     # based on whether that request method is expected to have
     # a body or not.
     if body is None:
         chunks = None
+        body_kind = BodyKind.NONE
         if method.upper() not in _METHODS_NOT_EXPECTING_BODY:
             content_length = 0
         else:
@@ -259,6 +295,7 @@ def body_to_chunks(
     elif isinstance(body, (str, bytes)):
         chunks = (to_bytes(body),)
         content_length = len(chunks[0])
+        body_kind = BodyKind.BYTES_LIKE
 
     # File-like object, TODO: use seek() and tell() for length?
     elif hasattr(body, "read"):
@@ -275,6 +312,7 @@ def body_to_chunks(
 
         chunks = chunk_readable()
         content_length = None
+        body_kind = BodyKind.REWINDABLE_FILE
 
     # Otherwise we need to start checking via duck-typing.
     else:
@@ -291,9 +329,14 @@ def body_to_chunks(
                     f"'body' must be a bytes-like object, file-like "
                     f"object, or iterable. Instead was {body!r}"
                 ) from None
+            else:
+                body_kind = BodyKind.ONE_SHOT_ITERABLE
         else:
             # Since it implements the buffer API can be passed directly to socket.sendall()
             chunks = (body,)
             content_length = mv.nbytes
+            body_kind = BodyKind.BYTES_LIKE
 
-    return ChunksAndContentLength(chunks=chunks, content_length=content_length)
+    return ChunksAndContentLength(
+        chunks=chunks, content_length=content_length, body_kind=body_kind
+    )

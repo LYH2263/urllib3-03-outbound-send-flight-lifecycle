@@ -8,10 +8,12 @@ from http.client import HTTPException as HTTPException  # noqa: F401
 from http.client import ResponseNotReady
 
 from ..._base_connection import _TYPE_BODY
+from ..._flight import RequestFlight
 from ...connection import HTTPConnection, ProxyConfig, port_by_scheme
 from ...exceptions import TimeoutError
 from ...response import BaseHTTPResponse
 from ...util.connection import _TYPE_SOCKET_OPTIONS
+from ...util.request import classify_body_kind
 from ...util.timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
 from ...util.url import Url
 from .fetch import _RequestError, _TimeoutError, send_request, send_streaming_request
@@ -42,6 +44,7 @@ class EmscriptenHTTPConnection:
 
     response_class: type[BaseHTTPResponse] = EmscriptenHttpResponseWrapper
     _response: EmscriptenResponse | None
+    _flight: RequestFlight | None
 
     def __init__(
         self,
@@ -61,6 +64,7 @@ class EmscriptenHTTPConnection:
         self.scheme = "http"
         self._closed = True
         self._response = None
+        self._flight = None
         # ignore these things because we don't
         # have control over that stuff
         self.proxy = None
@@ -116,15 +120,31 @@ class EmscriptenHTTPConnection:
             for k, v in headers.items():
                 request.set_header(k, v)
         self._response = None
+        # The browser fetch API submits the request atomically, so the
+        # granular socket phases can't be observed; we still expose the
+        # same flight object for middleware and the pool machinery.
+        flight = RequestFlight(
+            classify_body_kind(body), method=method, request_url=url
+        )
+        self._flight = flight
         try:
+            flight._headers_sent()
+            if body is not None:
+                flight._body_in_flight()
             if not preload_content:
                 self._response = send_streaming_request(request)
             if self._response is None:
                 self._response = send_request(request)
         except _TimeoutError as e:
+            flight._abort(e)
             raise TimeoutError(e.message) from e
         except _RequestError as e:
+            flight._abort(e)
             raise HTTPException(e.message) from e
+        except BaseException as e:
+            flight._abort(e)
+            raise
+        flight._complete()
 
     def getresponse(self) -> BaseHTTPResponse:
         if self._response is not None:
@@ -139,6 +159,7 @@ class EmscriptenHTTPConnection:
     def close(self) -> None:
         self._closed = True
         self._response = None
+        self._flight = None
 
     @property
     def is_closed(self) -> bool:
@@ -160,6 +181,11 @@ class EmscriptenHTTPConnection:
         errors are coming from the proxy layer or from tunnelling to the target origin.
         """
         return False
+
+    @property
+    def flight(self) -> RequestFlight | None:
+        """The outbound send flight of the most recent request, if any."""
+        return self._flight
 
 
 class EmscriptenHTTPSConnection(EmscriptenHTTPConnection):

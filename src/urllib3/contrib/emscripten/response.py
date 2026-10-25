@@ -15,6 +15,7 @@ from .request import EmscriptenRequest
 
 if typing.TYPE_CHECKING:
     from ..._base_connection import BaseHTTPConnection, BaseHTTPSConnection
+    from ..._flight import RequestFlight
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,15 @@ class EmscriptenHttpResponseWrapper(BaseHTTPResponse):
     @property
     def connection(self) -> BaseHTTPConnection | BaseHTTPSConnection | None:
         return self._connection
+
+    @property
+    def request_flight(self) -> RequestFlight | None:
+        # Responses aren't produced through the pooling layer's
+        # _make_request() on emscripten, so read the flight directly off
+        # the connection when it hasn't been attached explicitly.
+        if self._request_flight is not None:
+            return self._request_flight
+        return self._connection.flight if self._connection is not None else None
 
     @property
     def retries(self) -> Retry | None:
