@@ -1,0 +1,30 @@
+[run]
+source =
+    urllib3
+# Needed for Python 3.11 and lower
+disable_warnings = no-sysmon
+
+[paths]
+source =
+    src/urllib3
+    */urllib3
+    *\urllib3
+
+[report]
+omit =
+    src/urllib3/contrib/pyopenssl.py
+    src/urllib3/contrib/securetransport.py
+    src/urllib3/contrib/_securetransport/*
+
+exclude_lines =
+    except ModuleNotFoundError:
+    except ImportError:
+    pass
+    import
+    raise NotImplementedError
+    .* # Platform-specific.*
+    .*:.* # Python \d.*
+    .* # Abstract
+    .* # Defensive:
+    if (?:typing.)?TYPE_CHECKING:
+    ^\s*?\.\.\.\s*$
