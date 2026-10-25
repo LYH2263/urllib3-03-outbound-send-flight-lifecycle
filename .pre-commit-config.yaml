@@ -1,34 +1,34 @@
 repos:
   - repo: https://github.com/asottile/pyupgrade
-    rev: 75992aaa40730136014f34227e0135f63fc951b4 # frozen: v3.21.2
+    rev: f22ea0651f4355c655cc581f67813c991c74a312 # frozen: v3.22.0
     hooks:
       - id: pyupgrade
         args: ["--py310-plus"]
 
   - repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 4160603246a6b365d4a2af661c6d71b0a0f50478 # frozen: 26.5.1
+    rev: a5439e9af2ff9371297bb1a76a01b8ad17989b88 # frozen: 26.10.1
     hooks:
       - id: black
         args: ["--target-version", "py310"]
 
   - repo: https://github.com/PyCQA/isort
-    rev: 131f4adcd5582bfc53928ab0d740eceb8b506b6c # frozen: 9.0.1
+    rev: 9f905615631c545f5aea2516508109350d1d2f7d # frozen: 9.0.2
     hooks:
       - id: isort
 
   - repo: https://github.com/PyCQA/flake8
-    rev: c48217e1fc006c2dddd14df54e83b67da15de5cd # frozen: 7.3.0
+    rev: 7eccf20b526fe4f2230bf9afeeef2fc9f97faf8d # frozen: 7.4.1
     hooks:
       - id: flake8
         additional_dependencies: [flake8-2020]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0f34924c4110aca2294a4e4204aac7b3e31803fb # frozen: 0.12.7
+    rev: d4acaec07ac3bc6017fba3c3b8e9810af1b615db # frozen: 0.13.1
     hooks:
       - id: uv-lock
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: cef8b8350da46d8114c7e6b7272aebdccdf193ce # frozen: v1.30.0
+    rev: c92afdf2c6ca336aaa8f39e2bd8d48f62dbd8e1f # frozen: v1.31.1
     hooks:
       - id: zizmor
 
@@ -38,15 +38,15 @@ repos:
       - id: prettier
         types_or: [javascript]
   - repo: https://github.com/pre-commit/mirrors-eslint
-    rev: be68a779a7464c7c4c92e9410fb56e0cfc983d0d # frozen: v10.9.1
+    rev: 7ab6b7f5c5befd162fb5ddddc4af4c1b4fbfe11d # frozen: v10.13.0
     hooks:
       - id: eslint
         args: ["--fix"]
         additional_dependencies:
           # Configuring additional dependencies replaces the hook defaults,
           # so ESLint itself must be included explicitly.
-          - "eslint@10.9.1"
+          - "eslint@10.13.0"
           # ESLint 10 flat config provides recommended rules and worker globals
           # through these separate packages.
           - "@eslint/js@10.0.1"
-          - "globals@17.12.0"
+          - "globals@17.13.0"
